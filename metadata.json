@@ -1,0 +1,6 @@
+{
+  "name": "护理考研备考助手",
+  "description": "专为护理硕士研究生入学考试（308护理综合：内科护理、外科护理、基础护理、护理导论）研发的高精度智能备考App。提供完整考纲、精选题库、医学记忆口诀背诵卡与定制的6个月倒计时规划，搭载AI导师进行个性化护理答疑及动态模拟考题出圈，零死角攻破考研重难点。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
