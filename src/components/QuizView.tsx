@@ -31,7 +31,10 @@ export default function QuizView({ initialSubjectId = null, currentUser = null }
   // Custom states for loading custom quizzes
   const [customQuizzes, setCustomQuizzes] = useState<UserCustomQuestion[]>([]);
   const [isQuizzesSyncing, setIsQuizzesSyncing] = useState(false);
+  const [isQuizzesSyncingManual, setIsQuizzesSyncingManual] = useState(false);
+  const [syncQuizFeedback, setSyncQuizFeedback] = useState<string | null>(null);
   const [selectedChapterFilter, setSelectedChapterFilter] = useState<string>("all");
+
   const [quizLayoutMode, setQuizLayoutMode] = useState<"interactive" | "chapter-cards">("chapter-cards");
 
   // Custom Quiz Form adding states
@@ -383,14 +386,48 @@ export default function QuizView({ initialSubjectId = null, currentUser = null }
             </select>
           </div>
 
-          <button
-            onClick={() => setShowQuizForm(!showQuizForm)}
-            className="px-3.5 py-1.5 bg-slate-850 hover:bg-slate-750 active:bg-slate-800 text-slate-200 hover:text-white border border-slate-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition"
-            id="toggle-quiz-form-btn"
-          >
-            <Plus className="w-3.5 h-3.5 text-emerald-400" />
-            <span>{showQuizForm ? "收起录题窗口" : "随堂课·手动录题重温"}</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            {currentUser && (
+              <button
+                type="button"
+                onClick={async () => {
+                  setIsQuizzesSyncingManual(true);
+                  setSyncQuizFeedback(null);
+                  try {
+                    const localQuizzes = JSON.parse(localStorage.getItem("care_custom_quizzes") || "[]");
+                    const merged = await bulkSyncQuizzesToCloud(currentUser.uid, localQuizzes);
+                    setCustomQuizzes(merged);
+                    localStorage.setItem("care_custom_quizzes", JSON.stringify(merged));
+                    setSyncQuizFeedback("同步成功！");
+                    setTimeout(() => setSyncQuizFeedback(null), 3000);
+                  } catch (e) {
+                    console.error("Manual custom quiz sync failed: ", e);
+                    setSyncQuizFeedback("同步失败！");
+                    setTimeout(() => setSyncQuizFeedback(null), 3000);
+                  } finally {
+                    setIsQuizzesSyncingManual(false);
+                  }
+                }}
+                disabled={isQuizzesSyncingManual}
+                className="px-3.5 py-1.5 bg-indigo-900/40 hover:bg-indigo-900/65 text-indigo-200 hover:text-white border border-indigo-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                id="manual-sync-quizzes-btn"
+              >
+                {isQuizzesSyncingManual ? <RefreshCcw className="w-3.5 h-3.5 animate-spin text-white" /> : <span>☁️</span>}
+                <span>
+                  {isQuizzesSyncingManual ? "同步中..." : syncQuizFeedback ? `🎉 ${syncQuizFeedback}` : "手动同步备份题库"}
+                </span>
+              </button>
+            )}
+
+            <button
+              onClick={() => setShowQuizForm(!showQuizForm)}
+              className="px-3.5 py-1.5 bg-slate-855 hover:bg-slate-750 active:bg-slate-800 text-slate-200 hover:text-white border border-slate-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition"
+              id="toggle-quiz-form-btn"
+            >
+              <Plus className="w-3.5 h-3.5 text-emerald-400" />
+              <span>{showQuizForm ? "收起录题窗口" : "随堂课·手动录题重温"}</span>
+            </button>
+          </div>
         </div>
       </div>
 

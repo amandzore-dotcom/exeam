@@ -111,11 +111,12 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
   const [deck, setDeck] = useState<UserCustomCard[]>([]);
   const [activeSubjectId, setActiveSubjectId] = useState<SubjectId | "all">("all");
   const [activeType, setActiveType] = useState<"all" | "noun" | "cloze">("all");
-  const [ebbinghausFilter, setEbbinghausFilter] = useState<"all" | "due" | "mastered">("all");
+  const [ebbinghausFilter, setEbbinghausFilter] = useState<"all" | "due" | "mastered">("due");
   const [searchQuery, setSearchQuery] = useState("");
+  const [simulatedTimeOffsetMs, setSimulatedTimeOffsetMs] = useState(0);
 
   // Self test player states
-  const [studyMode, setStudyMode] = useState<"list" | "test">("list");
+  const [studyMode, setStudyMode] = useState<"list" | "learn" | "review">("list");
   const [testIdx, setTestIdx] = useState(0);
   const [isAnswerRevealed, setIsAnswerRevealed] = useState(false);
   const [clozeUserAnswer, setClozeUserAnswer] = useState("");
@@ -134,6 +135,8 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
   const [cardIdToDelete, setCardIdToDelete] = useState<string | null>(null);
   const [showRestoreConfirm, setShowRestoreConfirm] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [syncFeedback, setSyncFeedback] = useState<string | null>(null);
+
 
   // Load and manage custom review cards (local and cloud sync auto-handling)
   useEffect(() => {
@@ -189,8 +192,8 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
       answer: formAnswer.trim(),
       hint: formHint.trim() || undefined,
       createdAt: Date.now(),
-      ebbinghausStage: 1, // Start on Stage 1 (5 mins)
-      nextReviewTime: Date.now() + 5 * 60 * 1000,
+      ebbinghausStage: 0, // Start at 0 (Unlearned/New!)
+      nextReviewTime: Date.now(),
       recyclesCount: 0
     };
 
@@ -205,7 +208,7 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
     setFormTitle("");
     setFormAnswer("");
     setFormHint("");
-    setAddFeedback("🎉 成功录入！此考点已同步载入您的黄金复习卡盒。");
+    setAddFeedback("🎉 成功录入！此考点已同步载入您的待学清单，首次自测过关后将送入艾宾浩斯复习卡盒。");
     
     // Clear feedback after 3 seconds
     setTimeout(() => setAddFeedback(null), 3000);
@@ -228,6 +231,38 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
       setTestIdx(Math.max(0, updated.length - 1));
     }
     setCardIdToDelete(null);
+  };
+
+  // Mark a new card as learned and transition it to Stage 1 (Ebbinghaus curve begins)
+  const markAsLearned = (cardId: string) => {
+    const updated = deck.map((c) => {
+      if (c.id !== cardId) return c;
+      const updatedCard: UserCustomCard = {
+        ...c,
+        ebbinghausStage: 1, // Start on Stage 1 (5 mins)
+        nextReviewTime: Date.now() + 5 * 60 * 1000,
+        recyclesCount: 0
+      };
+      if (currentUser) {
+        uploadUserCard(currentUser.uid, updatedCard);
+      }
+      return updatedCard;
+    });
+
+    saveDeck(updated);
+
+    setAddFeedback("🎉 恭喜！该考点已成功‘自测过关’，进入艾宾浩斯复习曲线轮转！");
+    setTimeout(() => setAddFeedback(null), 3000);
+
+    setIsAnswerRevealed(false);
+    setClozeUserAnswer("");
+    setIsClozeCorrect(null);
+
+    // Dynamic index adjustment
+    const remainingCount = updated.filter(c => (c.ebbinghausStage || 0) === 0).length;
+    if (testIdx >= remainingCount) {
+      setTestIdx(Math.max(0, remainingCount - 1));
+    }
   };
 
   const updateEbbinghaus = (cardId: string, isCorrect: boolean) => {
@@ -261,16 +296,6 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
     });
     
     saveDeck(updated);
-  };
-
-  // Reset core test states
-  const startTesting = () => {
-    if (filteredDeck.length === 0) return;
-    setStudyMode("test");
-    setTestIdx(0);
-    setIsAnswerRevealed(false);
-    setClozeUserAnswer("");
-    setIsClozeCorrect(null);
   };
 
   const handleNextTest = () => {
@@ -321,14 +346,25 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
     const matchesSubject = activeSubjectId === "all" || card.subjectId === activeSubjectId;
     const matchesType = activeType === "all" || card.type === activeType;
     
-    // Ebbinghaus filter logic
-    let matchesEbbinghaus = true;
-    if (ebbinghausFilter === "due") {
-      // Due if never reviewed, or now is past/at nextReviewTime
-      matchesEbbinghaus = card.nextReviewTime ? Date.now() >= card.nextReviewTime : true;
-    } else if (ebbinghausFilter === "mastered") {
-      // Completed / mastered on Stage 8
-      matchesEbbinghaus = (card.ebbinghausStage || 0) === 8;
+    // Segment by studyMode tabs
+    if (studyMode === "learn") {
+      // Only unlearned cards (Stage 0) in learning tab
+      if ((card.ebbinghausStage || 0) !== 0) return false;
+    } else if (studyMode === "review") {
+      // Only learned cards (Stage > 0) in review tab
+      if ((card.ebbinghausStage || 0) === 0) return false;
+
+      // STRICT RULE: Only filter by due time when the user specifically selects "due" (今日超期温故) or "mastered" (已通关且待温故)
+      if (ebbinghausFilter === "due" || ebbinghausFilter === "mastered") {
+        const isDue = card.nextReviewTime ? (Date.now() + simulatedTimeOffsetMs) >= card.nextReviewTime : true;
+        if (!isDue) return false;
+      }
+
+      // Ebbinghaus filter logic inside review mode
+      if (ebbinghausFilter === "mastered") {
+        // Completed / mastered on Stage 8
+        if ((card.ebbinghausStage || 0) !== 8) return false;
+      }
     }
 
     const term = searchQuery.toLowerCase().trim();
@@ -337,8 +373,15 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
       card.answer.toLowerCase().includes(term) || 
       (card.hint && card.hint.toLowerCase().includes(term));
 
-    return matchesSubject && matchesType && matchesEbbinghaus && matchesSearch;
+    return matchesSubject && matchesType && matchesSearch;
   });
+
+  // Defensive check for testIdx safety
+  useEffect(() => {
+    if (filteredDeck.length > 0 && testIdx >= filteredDeck.length) {
+      setTestIdx(filteredDeck.length - 1);
+    }
+  }, [filteredDeck.length, testIdx]);
 
   const activeTestCard = filteredDeck[testIdx];
 
@@ -352,18 +395,29 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
   const countStage4to7 = deck.filter((c) => (c.ebbinghausStage || 0) >= 4 && (c.ebbinghausStage || 0) <= 7).length;
   const countStage8 = deck.filter((c) => (c.ebbinghausStage || 0) === 8).length;
 
-  // Weighted retention calculation reflecting probability curve of real Ebbinghaus curve values
+  // Weighted retention calculation reflecting probability curve of real Ebbinghaus curve values, decaying if time-travelled past due time without reviewing
   const retentionScore = deck.length === 0 ? 0 : Math.round(
     deck.reduce((sum, c) => {
       const st = c.ebbinghausStage || 0;
-      if (st === 8) return sum + 99;
-      if (st === 7) return sum + 90;
-      if (st === 6) return sum + 80;
-      if (st === 5) return sum + 70;
-      if (st === 4) return sum + 55;
-      if (st === 3) return sum + 40;
-      if (st === 2) return sum + 25;
-      return sum + 10;
+      let baseRet = 10;
+      if (st === 8) baseRet = 99;
+      else if (st === 7) baseRet = 90;
+      else if (st === 6) baseRet = 80;
+      else if (st === 5) baseRet = 70;
+      else if (st === 4) baseRet = 55;
+      else if (st === 3) baseRet = 40;
+      else if (st === 2) baseRet = 25;
+      else baseRet = 15;
+
+      // Scientific forgetting curve decay
+      if (c.nextReviewTime && (Date.now() + simulatedTimeOffsetMs) > c.nextReviewTime) {
+        const overDueHours = ((Date.now() + simulatedTimeOffsetMs) - c.nextReviewTime) / (1000 * 60 * 60);
+        const halfLifeHours = st === 8 ? 360 : st === 7 ? 168 : st === 6 ? 96 : st === 5 ? 48 : st === 4 ? 24 : st === 3 ? 12 : st === 2 ? 4 : 1;
+        const decayFactor = Math.pow(0.5, overDueHours / halfLifeHours);
+        baseRet = Math.max(8, Math.round(baseRet * decayFactor));
+      }
+
+      return sum + baseRet;
     }, 0) / deck.length
   );
 
@@ -387,6 +441,35 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
           </div>
 
           <div className="flex flex-wrap gap-2 shrink-0" id="deck-top-actions">
+            {currentUser && (
+              <button
+                onClick={async () => {
+                  setIsSyncing(true);
+                  setSyncFeedback(null);
+                  try {
+                    const localCards = JSON.parse(localStorage.getItem("care_custom_review_deck") || "[]");
+                    const merged = await bulkSyncCardsToCloud(currentUser.uid, localCards);
+                    setDeck(merged);
+                    localStorage.setItem("care_custom_review_deck", JSON.stringify(merged));
+                    setSyncFeedback("同步成功！");
+                    setTimeout(() => setSyncFeedback(null), 3000);
+                  } catch (e) {
+                    console.error("Cloud card sync failed: ", e);
+                    setSyncFeedback("同步失败！");
+                    setTimeout(() => setSyncFeedback(null), 3000);
+                  } finally {
+                    setIsSyncing(false);
+                  }
+                }}
+                disabled={isSyncing}
+                className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs rounded-xl font-bold transition flex items-center gap-1.5 shadow-xs cursor-pointer"
+              >
+                {isSyncing ? <RotateCw className="w-3.5 h-3.5 animate-spin" /> : <span>☁️</span>}
+                <span>
+                  {isSyncing ? "云端同步中..." : syncFeedback ? `🎉 ${syncFeedback}` : "手动同步备份卡盒"}
+                </span>
+              </button>
+            )}
             <button
               onClick={() => setShowAddForm(!showAddForm)}
               className={`px-4 py-2 text-xs font-semibold rounded-xl transition flex items-center gap-1 ${
@@ -484,6 +567,86 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
             <p className="text-[10.5px] text-emerald-800 leading-relaxed mt-1.5 font-sans font-semibold">
               为保障复习自考模式<strong>彻底一直持续到考前</strong>，即使卡片达到最高 <strong>Stage 8 (终极熟记 💯)</strong>，也会遵循艾宾浩斯终极保护，每隔 <strong>15 天</strong>全自动轮出复查一次，保证长期记忆链条绝不退化瓦解！
             </p>
+          </div>
+        </div>
+
+        {/* ⏱️ Ebbinghaus Time Travel Simulator (Scientific Forgetting Verification Desk) */}
+        <div className="bg-slate-900 text-white rounded-xl p-4 border border-slate-800 space-y-3" id="ebbinghaus-time-machine">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-emerald-400 animate-pulse text-xs">⏱️</span>
+              <span className="text-xs font-black">艾宾浩斯科学遗忘模拟时光机</span>
+              <span className="text-[8px] bg-emerald-950 text-emerald-400 border border-emerald-800 px-1.5 py-0.2 rounded-full font-mono">
+                SIMULATION
+              </span>
+            </div>
+            {simulatedTimeOffsetMs > 0 && (
+              <span className="text-[10px] text-amber-400 font-bold bg-amber-950/80 px-2 py-0.5 rounded border border-amber-900/40">
+                已向后飞跃：{(simulatedTimeOffsetMs / (1000 * 60 * 60 * 24)).toFixed(1)} 天后
+              </span>
+            )}
+          </div>
+          <p className="text-[10.5px] text-slate-400 leading-relaxed">
+            由于大考记忆是一个持续性过程，通过下方飞跃按钮可测试由于<strong>“时间流逝而不断遗忘”</strong>的科学规律。您将直观看见随着天数变迁，卡片何时会批量变为<strong>“⚡ 超期需温”</strong>，以及记忆存备率的真实消退！
+          </p>
+          
+          <div className="flex flex-wrap gap-2 pt-1" id="time-travel-actions">
+            <button
+              type="button"
+              onClick={() => setSimulatedTimeOffsetMs(0)}
+              className={`px-2.5 py-1.5 rounded-lg text-[10.5px] font-bold transition-all ${
+                simulatedTimeOffsetMs === 0 
+                  ? "bg-emerald-600 text-white shadow-xs" 
+                  : "bg-slate-800 hover:bg-slate-750 text-slate-300"
+              }`}
+            >
+              🔄 重置到此刻
+            </button>
+            <button
+              type="button"
+              onClick={() => setSimulatedTimeOffsetMs(1 * 60 * 60 * 1000)} // 1 hour
+              className={`px-2.5 py-1.5 rounded-lg text-[10.5px] font-bold transition-all ${
+                simulatedTimeOffsetMs === 1 * 60 * 60 * 1000 ? "bg-amber-600 text-white" : "bg-slate-800 hover:bg-slate-750 text-slate-300"
+              }`}
+            >
+              🚀 1小时后
+            </button>
+            <button
+              type="button"
+              onClick={() => setSimulatedTimeOffsetMs(1 * 24 * 60 * 60 * 1000)} // 1 day
+              className={`px-2.5 py-1.5 rounded-lg text-[10.5px] font-bold transition-all ${
+                simulatedTimeOffsetMs === 1 * 24 * 60 * 60 * 1000 ? "bg-amber-600 text-white" : "bg-slate-800 hover:bg-slate-750 text-slate-300"
+              }`}
+            >
+              🚀 1天后 (24h)
+            </button>
+            <button
+              type="button"
+              onClick={() => setSimulatedTimeOffsetMs(4 * 24 * 60 * 60 * 1000)} // 4 days
+              className={`px-2.5 py-1.5 rounded-lg text-[10.5px] font-bold transition-all ${
+                simulatedTimeOffsetMs === 4 * 24 * 60 * 60 * 1000 ? "bg-amber-600 text-white" : "bg-slate-800 hover:bg-slate-750 text-slate-300"
+              }`}
+            >
+              🚀 4天后
+            </button>
+            <button
+              type="button"
+              onClick={() => setSimulatedTimeOffsetMs(7 * 24 * 60 * 60 * 1000)} // 7 days
+              className={`px-2.5 py-1.5 rounded-lg text-[10.5px] font-bold transition-all ${
+                simulatedTimeOffsetMs === 7 * 24 * 60 * 60 * 1000 ? "bg-amber-600 text-white" : "bg-slate-800 hover:bg-slate-750 text-slate-300"
+              }`}
+            >
+              🚀 7天后
+            </button>
+            <button
+              type="button"
+              onClick={() => setSimulatedTimeOffsetMs(15 * 24 * 60 * 60 * 1000)} // 15 days
+              className={`px-2.5 py-1.5 rounded-lg text-[10.5px] font-bold transition-all ${
+                simulatedTimeOffsetMs === 15 * 24 * 60 * 60 * 1000 ? "bg-amber-600 text-white" : "bg-slate-800 hover:bg-slate-750 text-slate-300"
+              }`}
+            >
+              🚀 15天后 (终极轮转温故)
+            </button>
           </div>
         </div>
 
@@ -626,7 +789,7 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
               </span>
               <button
                 type="submit"
-                className="px-6 py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs rounded-xl shadow-xs transition"
+                className="px-6 py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs rounded-xl shadow-xs transition cursor-pointer"
                 id="btn-add-card-submit"
               >
                 💾 确认保存并录入卡盒
@@ -638,48 +801,61 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
 
       {/* Mode Switches & Filters */}
       <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4 py-2 border-b border-gray-100" id="deck-filters-bar">
-        {/* Toggle Mode */}
-        <div className="flex bg-gray-100 p-1 rounded-xl" id="toggle-study-mode-box">
+        {/* Toggle Mode: 3 Windows */}
+        <div className="flex bg-slate-100/80 p-1 rounded-xl border border-gray-200/50" id="toggle-study-mode-box">
           <button
-            onClick={() => setStudyMode("list")}
-            className={`px-4 py-2 text-xs font-bold rounded-lg transition-colors ${
-              studyMode === "list" ? "bg-white text-gray-900 shadow-xs" : "text-gray-500 hover:text-gray-800"
+            onClick={() => { setStudyMode("list"); setTestIdx(0); }}
+            className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+              studyMode === "list" 
+                ? "bg-white text-emerald-950 shadow-xs" 
+                : "text-gray-500 hover:text-slate-800"
             }`}
           >
-            📋 自建手记库 ({filteredDeck.length} 条)
+            📋 手记库 ({deck.length})
           </button>
           <button
-            disabled={filteredDeck.length === 0}
-            onClick={startTesting}
-            className={`px-4 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1 ${
-              studyMode === "test" 
+            onClick={() => { setStudyMode("learn"); setTestIdx(0); setIsAnswerRevealed(false); }}
+            className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-all flex items-center gap-1 cursor-pointer ${
+              studyMode === "learn" 
                 ? "bg-emerald-600 text-white shadow-xs" 
-                : "text-gray-500 hover:text-gray-800 disabled:opacity-50"
+                : "text-gray-500 hover:text-slate-800"
             }`}
           >
-            🎯 自测过关模式（轮转）
+            🆕 新词待学 ({deck.filter(c => (c.ebbinghausStage || 0) === 0).length})
+          </button>
+          <button
+            onClick={() => { setStudyMode("review"); setTestIdx(0); setIsAnswerRevealed(false); }}
+            className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-all flex items-center gap-1 cursor-pointer ${
+              studyMode === "review" 
+                ? "bg-indigo-650 bg-indigo-600 text-white shadow-xs" 
+                : "text-indigo-600 hover:text-indigo-900 bg-indigo-50/60"
+            }`}
+          >
+            🎯 艾氏复习 (已入轨: {deck.filter(c => (c.ebbinghausStage || 0) > 0).length} | 待温故: {deck.filter(c => (c.ebbinghausStage || 0) > 0 && (c.nextReviewTime ? (Date.now() + simulatedTimeOffsetMs) >= c.nextReviewTime : true)).length})
           </button>
         </div>
 
         {/* Filters */}
         <div className="flex flex-wrap items-center gap-2" id="filter-dropdowns">
-          {/* Ebbinghaus Filter */}
-          <select
-            value={ebbinghausFilter}
-            onChange={(e) => { setEbbinghausFilter(e.target.value as any); setTestIdx(0); }}
-            className="text-xs p-2 bg-emerald-50 border border-emerald-200 rounded-lg text-emerald-800 font-bold"
-            id="filter-ebbinghaus-dropdown"
-          >
-            <option value="all">📊 艾宾浩斯(全量数据)</option>
-            <option value="due">🚀 艾宾浩斯(今日超期温故)</option>
-            <option value="mastered">🏆 艾宾浩斯(已彻底通关)</option>
-          </select>
+          {/* Ebbinghaus Filter (Only shown for Review mode) */}
+          {studyMode === "review" && (
+            <select
+              value={ebbinghausFilter}
+              onChange={(e) => { setEbbinghausFilter(e.target.value as any); setTestIdx(0); }}
+              className="text-xs p-2 bg-emerald-50 border border-emerald-200 rounded-lg text-emerald-800 font-bold"
+              id="filter-ebbinghaus-dropdown"
+            >
+              <option value="due">🚀 艾氏复习 (仅看今日到期温故)</option>
+              <option value="all">📊 艾氏复习 (查看全部复习卡)</option>
+              <option value="mastered">🏆 艾氏复习 (仅看已彻底通关考点)</option>
+            </select>
+          )}
 
           {/* Card filter Type */}
           <select
             value={activeType}
             onChange={(e) => { setActiveType(e.target.value as any); setTestIdx(0); }}
-            className="text-xs p-2 bg-white border border-gray-200 rounded-lg text-gray-700"
+            className="text-xs p-2 bg-white border border-gray-200 rounded-lg text-gray-700 font-semibold"
             id="filter-type-dropdown"
           >
             <option value="all">所有卡片类型</option>
@@ -717,12 +893,12 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
         </div>
       </div>
 
-      {/* CORE DISPLAY (Double paths depending on selected study mode) */}
+      {/* CORE DISPLAY (Three paths depending on selected study mode) */}
       {studyMode === "list" ? (
         /* GRID DECK LIST VIEW */
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" id="deck-grid-items">
           {filteredDeck.length === 0 ? (
-            <div className="col-span-full text-center py-16 bg-white border rounded-2xl text-gray-400" id="filtered-deck-empty">
+            <div className="col-span-full text-center py-16 bg-white border border-gray-200 rounded-2xl text-gray-400" id="filtered-deck-empty">
               <HelpCircle className="w-12 h-12 text-gray-300 mx-auto mb-3" />
               <h4 className="font-semibold text-gray-800">未找到符合当前条件的考点卡片</h4>
               <p className="text-xs text-gray-500 mt-1 mb-4">您可以清除搜索筛选项，或在上方点击“手动录入新知识点”建立自己的首张卡片。</p>
@@ -761,7 +937,11 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
                       <span className="text-emerald-800 font-extrabold px-1.5 py-0.5 bg-emerald-50 rounded-sm shrink-0">
                         {EBBINGHAUS_INTERVALS[card.ebbinghausStage || 0].label}
                       </span>
-                      {card.nextReviewTime && Date.now() >= card.nextReviewTime ? (
+                      {card.ebbinghausStage === 0 ? (
+                        <span className="bg-blue-50 text-blue-600 font-extrabold px-1.5 py-0.5 rounded-sm shrink-0 animate-pulse">
+                          🆕 待学新词
+                        </span>
+                      ) : card.nextReviewTime && (Date.now() + simulatedTimeOffsetMs) >= card.nextReviewTime ? (
                         <span className="bg-rose-50 text-rose-600 font-extrabold px-1.5 py-0.5 rounded-sm animate-pulse shrink-0">
                           ⚡ 超期需温
                         </span>
@@ -797,13 +977,13 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
                         <span className="text-[9px] text-rose-500 font-bold">确认删除此随记吗？</span>
                         <button
                           onClick={() => confirmDeleteCard(card.id)}
-                          className="bg-rose-600 hover:bg-rose-700 text-white font-bold px-1.5 py-0.5 rounded text-[8.5px]"
+                          className="bg-rose-600 hover:bg-rose-700 text-white font-bold px-1.5 py-0.5 rounded text-[8.5px] cursor-pointer"
                         >
                           确认
                         </button>
                         <button
                           onClick={() => setCardIdToDelete(null)}
-                          className="bg-gray-250 hover:bg-gray-300 text-gray-700 font-bold px-1.5 py-0.5 rounded text-[8.5px]"
+                          className="bg-gray-250 hover:bg-gray-300 text-gray-700 font-bold px-1.5 py-0.5 rounded text-[8.5px] cursor-pointer"
                         >
                           取消
                         </button>
@@ -823,33 +1003,48 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
             })
           )}
         </div>
-      ) : (
-        /* RANDOM SELF TEST PLAYER MODE */
-        <div className="max-w-3xl mx-auto" id="self-test-player-container">
-          {!activeTestCard ? (
-            <div className="bg-white rounded-2xl border p-12 text-center" id="test-empty-notice">
-              <HelpCircle className="w-12 h-12 text-gray-300 mx-auto mb-2" />
-              <p className="text-gray-600 text-sm">由于没有相应卡片信息，无法开展轮转自检。您可以先切换回「自建手记库」。</p>
+      ) : studyMode === "learn" ? (
+        /* LEARN WINDOW (ONLY UNLEARNED CARDS) */
+        <div className="max-w-3xl mx-auto" id="self-learn-player-container">
+          {filteredDeck.length === 0 ? (
+            <div className="bg-white rounded-2xl border border-gray-200 p-12 text-center shadow-xs" id="learn-empty-notice">
+              <CheckCircle2 className="w-14 h-14 text-emerald-500 mx-auto mb-3" />
+              <h4 className="font-bold text-gray-800 text-base">🎉 太棒了！新词待学过关清单已清空！</h4>
+              <p className="text-gray-500 text-xs mt-1.5 max-w-md mx-auto leading-relaxed">
+                您录入的所有知识考点均已通过首次自学自测，并且成功送入了艾宾浩斯科学记忆曲线中。
+              </p>
+              <div className="mt-6 flex justify-center gap-3">
+                <button
+                  onClick={() => setShowAddForm(true)}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl transition cursor-pointer"
+                >
+                  ➕ 录入新考点
+                </button>
+                <button
+                  onClick={() => { setStudyMode("review"); setTestIdx(0); }}
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition cursor-pointer"
+                >
+                  🎯 前往艾宾浩斯复习窗口
+                </button>
+              </div>
             </div>
           ) : (
-            <div className="space-y-6" id="test-active-deck">
-              {/* Card Container with custom glowing elements */}
-              <div className="bg-white rounded-3xl border border-emerald-100 shadow-md p-6 sm:p-8 space-y-6 relative overflow-hidden" id="active-test-shell">
+            <div className="space-y-6" id="learn-active-deck">
+              <div className="bg-white rounded-3xl border border-emerald-100 shadow-sm p-6 sm:p-8 space-y-6 relative overflow-hidden" id="active-learn-shell">
                 
                 {/* Meta details */}
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b pb-4 border-gray-100 gap-3" id="test-meta-bar">
-                  <div className="flex flex-col gap-1">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b pb-4 border-gray-100 gap-3" id="learn-meta-bar">
+                  <div className="flex flex-col gap-1 text-left">
                     <span className="text-xs font-bold text-gray-400">
-                      自测轮转: {testIdx + 1} / {filteredDeck.length} 道卡片
+                      🆕 新词初学过关: {testIdx + 1} / {filteredDeck.length} 道
                     </span>
-                    <span className="text-[10px] text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-md font-bold flex items-center gap-1 w-max">
+                    <span className="text-[10px] text-blue-600 bg-blue-50 px-2 py-0.5 rounded-md font-bold flex items-center gap-1 w-max">
                       <Brain className="w-3 h-3" />
-                      当前记忆区：{EBBINGHAUS_INTERVALS[activeTestCard.ebbinghausStage || 0].label}
-                      {activeTestCard.recyclesCount && activeTestCard.recyclesCount > 0 ? ` (已忘 ${activeTestCard.recyclesCount} 回)` : ""}
+                      当前状态：未学新词 (Stage 0)
                     </span>
                   </div>
                   
-                  <div className="flex gap-2 text-right justify-end" id="test-tags-row">
+                  <div className="flex gap-2 text-right justify-end" id="learn-tags-row">
                     <span className="bg-emerald-50 text-emerald-800 text-[10px] px-2 py-0.5 rounded-sm font-bold uppercase">
                       {SUBJECTS[activeTestCard.subjectId].name}
                     </span>
@@ -862,48 +1057,47 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
                 </div>
 
                 {/* Question stage */}
-                <div className="py-6 space-y-4 text-center" id="test-question-box">
+                <div className="py-6 space-y-4 text-center" id="learn-question-box">
                   {activeTestCard.type === "noun" ? (
-                    <div id="test-noun-text">
-                      <span className="text-xs text-gray-400 block mb-2 font-medium">请回忆并说出以下医学名词的含义：</span>
+                    <div id="learn-noun-text">
+                      <span className="text-xs text-gray-400 block mb-2 font-medium">请闭眼回忆，并试着口述解释以下医学名词的含义：</span>
                       <h3 className="text-xl sm:text-2xl font-extrabold text-slate-900 tracking-tight">
                         {activeTestCard.title}
                       </h3>
                     </div>
                   ) : (
-                    <div id="test-cloze-text">
-                      <span className="text-xs text-gray-400 block mb-2 font-medium">请阅读并拟写出缺省空格处的关键词语：</span>
-                      <p className="text-sm sm:text-base text-gray-800 leading-relaxed font-semibold bg-gray-50/50 p-4 rounded-xl border border-gray-100" id="cloze-content-para">
+                    <div id="learn-cloze-text">
+                      <span className="text-xs text-gray-400 block mb-2 font-medium">请阅读题干，并在脑海中拼写或在下方打字写出缺省内容：</span>
+                      <p className="text-sm sm:text-base text-gray-800 leading-relaxed font-semibold bg-gray-50/50 p-4 rounded-xl border border-gray-100" id="learn-cloze-content-para">
                         {activeTestCard.title}
                       </p>
                     </div>
                   )}
 
                   {activeTestCard.hint && (
-                    <div className="inline-flex items-center gap-1 text-[10px] bg-rose-50 border border-rose-100 text-rose-700 px-3 py-1 rounded-full text-left" id="test-hint-block">
+                    <div className="inline-flex items-center gap-1 text-[10px] bg-rose-50 border border-rose-100 text-rose-700 px-3 py-1 rounded-full text-left" id="learn-hint-block">
                       <Lightbulb className="w-3.5 h-3.5 text-rose-500 shrink-0" />
-                      <span>博傲课上重点关联：{activeTestCard.hint}</span>
+                      <span>博傲背诵诀窍：{activeTestCard.hint}</span>
                     </div>
                   )}
                 </div>
 
-                {/* Input block - only shown for cloze type prior to reveal */}
+                {/* Cloze input for learning */}
                 {activeTestCard.type === "cloze" && !isAnswerRevealed && (
-                  <div className="bg-slate-50 p-4 rounded-2xl border border-gray-100 space-y-3" id="cloze-self-type-answer-box">
-                    <label className="block text-xs font-bold text-gray-500">✍️ 请在此打出你的记诵答案（自检敲字，可多空用分号隔开）：</label>
-                    <div className="flex gap-2" id="cloze-input-row">
+                  <div className="bg-slate-50 p-4 rounded-2xl border border-gray-100 space-y-3 text-left" id="learn-cloze-check-box">
+                    <label className="block text-xs font-bold text-gray-500">✍️ 拼写我的备考自测词：</label>
+                    <div className="flex gap-2">
                       <input
                         type="text"
                         value={clozeUserAnswer}
                         onChange={(e) => setClozeUserAnswer(e.target.value)}
-                        placeholder="输入你的答案（自考手感），然后点核对答案"
+                        placeholder="在此尝试输入答案..."
                         className="flex-1 px-4 py-2.5 bg-white border border-gray-300 rounded-xl text-xs sm:text-sm focus:outline-hidden focus:border-emerald-500"
-                        id="cloze-response-input"
+                        id="learn-cloze-input"
                       />
                       <button
                         onClick={checkClozeAnswer}
-                        className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-semibold shadow-xs transition shrink-0"
-                        id="btn-check-cloze"
+                        className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-semibold shadow-xs transition shrink-0 cursor-pointer"
                       >
                         核对答案
                       </button>
@@ -912,71 +1106,265 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
                 )}
 
                 {/* Answer reveal container */}
-                <div className="border-t border-gray-100 pt-6" id="revealed-answers-board">
+                <div className="border-t border-gray-100 pt-6">
                   {isAnswerRevealed ? (
-                    <div className="bg-emerald-50 bg-opacity-70 p-5 rounded-2xl border border-emerald-100 space-y-4 animate-in fade-in duration-300 text-left" id="reveal-content">
+                    <div className="bg-emerald-50 bg-opacity-70 p-5 rounded-2xl border border-emerald-100 space-y-4 text-left animate-in fade-in duration-300">
                       {activeTestCard.type === "cloze" && isClozeCorrect !== null && (
-                        <div className="flex items-center gap-2 font-bold mb-1" id="clozecheck-status-indicator">
+                        <div className="flex items-center gap-2 font-bold mb-1">
                           {isClozeCorrect ? (
                             <span className="text-emerald-700 text-xs flex items-center gap-1">
                               <CheckCircle2 className="w-4 h-4 text-emerald-600 fill-emerald-100" />
-                              您的答案拼写与核心要领大致匹配！
+                              拼写完全匹配！记忆过关。
                             </span>
                           ) : (
                             <span className="text-rose-700 text-xs flex items-center gap-1">
                               <XCircle className="w-4 h-4 text-rose-500 fill-rose-100" />
-                              拼写与大纲标准有一些差异，让我们核对以下精确标准答案。
+                              略有差异，让我们对照官方精准大纲：
                             </span>
                           )}
                         </div>
                       )}
 
-                      <div id="revel-exact-standard">
+                      <div>
                         <span className="text-[10px] font-extrabold text-emerald-800 uppercase tracking-wider block mb-1">
-                          大纲/博傲标准答案解剖：
+                          教科书/博傲标准答案：
                         </span>
                         <p className="text-slate-900 font-mono text-sm leading-relaxed whitespace-pre-line">
                           {activeTestCard.answer}
                         </p>
                       </div>
 
-                      <div className="pt-2 text-[10px] text-gray-400 italic block">
-                        核对完毕了吗？你可以标记：[记住了] 将其归入高分掌握，或者稍后在复习本中重新轮转！
+                      <div className="pt-2 text-[10px] text-gray-400 italic">
+                        理解该定义之后，请点击下方「自测已过关」将其移入艾宾浩斯曲线，进入循环复习。
                       </div>
                     </div>
                   ) : (
                     activeTestCard.type === "noun" && (
                       <button
-                        onClick={() => setIsRevealedAnswers(activeTestCard.id)}
-                        className="w-full py-4 bg-slate-900 hover:bg-slate-800 transition text-white rounded-2xl text-xs md:text-sm font-semibold flex items-center justify-center gap-1.5 shadow-xs"
-                        id="btn-trigger-reveal"
+                        onClick={() => setIsAnswerRevealed(true)}
+                        className="w-full py-4 bg-slate-900 hover:bg-slate-800 transition text-white rounded-2xl text-xs md:text-sm font-semibold flex items-center justify-center gap-1.5 shadow-xs cursor-pointer"
                       >
                         <Eye className="w-4 h-4 text-emerald-400" />
-                        <span>🧐 细想并模拟阐释它的意思，点击比对背诵释义</span>
+                        <span>🧐 我想好了，点击核对标准教科书释义</span>
+                      </button>
+                    )
+                  )}
+                </div>
+
+                {/* Action Buttons */}
+                <div className="flex items-center justify-between pt-4 border-t border-gray-100">
+                  <div className="flex gap-2">
+                    {isAnswerRevealed ? (
+                      <button
+                        onClick={() => markAsLearned(activeTestCard.id)}
+                        className="px-5 py-3 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black rounded-xl flex items-center gap-1.5 transition shadow-sm cursor-pointer"
+                      >
+                        <Check className="w-4 h-4" />
+                        <span>🚀 自测已过关，送入复习通道</span>
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => setIsAnswerRevealed(true)}
+                        className="px-4 py-2.5 bg-gray-150 hover:bg-gray-200 text-gray-700 text-xs font-semibold rounded-xl cursor-pointer"
+                      >
+                        亮出标准答案
+                      </button>
+                    )}
+                  </div>
+
+                  <button
+                    onClick={handleNextTest}
+                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg flex items-center gap-1 transition cursor-pointer"
+                  >
+                    <span>看下一个</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+        /* REVIEW WINDOW (ONLY LEARNED CARDS IN EBBINGHAUS) */
+        <div className="max-w-3xl mx-auto" id="self-review-player-container">
+          {filteredDeck.length === 0 ? (
+            <div className="bg-indigo-50/50 rounded-2xl border border-indigo-100 p-12 text-center shadow-xs" id="review-empty-notice">
+              <CheckCircle2 className="w-14 h-14 text-indigo-500 mx-auto mb-3" />
+              {deck.filter(c => (c.ebbinghausStage || 0) > 0).length === 0 ? (
+                <>
+                  <h4 className="font-black text-indigo-900 text-base">
+                    🎯 您的艾宾浩斯复习库目前还是空的
+                  </h4>
+                  <p className="text-gray-500 text-xs mt-2 max-w-md mx-auto leading-relaxed">
+                    您录入的所有新考点目前都在「🆕 新词待学」清单中。请先前往待学清单进行首次自测，一旦自测过关，考点就会被自动送入艾宾浩斯记忆曲线并在这里开始复习！
+                  </p>
+                </>
+              ) : (
+                <>
+                  <h4 className="font-black text-indigo-900 text-base">
+                    🎉 绝妙！当前筛选条件/到期时间下没有需要温故的卡片！
+                  </h4>
+                  <p className="text-gray-500 text-xs mt-2 max-w-md mx-auto leading-relaxed">
+                    全库共有 <strong>{deck.filter(c => (c.ebbinghausStage || 0) > 0).length}</strong> 张考点卡片已载入记忆曲线中稳步轮转。由于暂未到期，它们被智能隐藏了。您可以切换上方筛选下拉框为「📊 查看全部复习卡」以预览它们，或拉动上方的「科学遗忘时光机」模拟未来遗忘走势！
+                  </p>
+                </>
+              )}
+              <div className="mt-6 flex justify-center gap-3">
+                <button
+                  onClick={() => { setStudyMode("list"); setTestIdx(0); }}
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition cursor-pointer"
+                >
+                  📋 浏览手记库全量卡片
+                </button>
+                <button
+                  onClick={() => { setStudyMode("learn"); setTestIdx(0); }}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl transition cursor-pointer"
+                >
+                  🆕 前往「新词待学过关」
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-6">
+              <div className="bg-white rounded-3xl border border-indigo-100 shadow-sm p-6 sm:p-8 space-y-6 relative overflow-hidden">
+                
+                {/* Meta details */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b pb-4 border-gray-100 gap-3">
+                  <div className="flex flex-col gap-1 text-left">
+                    <span className="text-xs font-bold text-indigo-950">
+                      艾氏复习轮转: {testIdx + 1} / {filteredDeck.length} 道
+                    </span>
+                    <span className="text-[10px] text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-md font-bold flex items-center gap-1 w-max">
+                      <Brain className="w-3 h-3 text-indigo-500" />
+                      当前记忆阶段：{EBBINGHAUS_INTERVALS[activeTestCard.ebbinghausStage || 0].label}
+                      {activeTestCard.recyclesCount && activeTestCard.recyclesCount > 0 ? ` (已巩固重温过 ${activeTestCard.recyclesCount} 回)` : ""}
+                    </span>
+                  </div>
+                  
+                  <div className="flex gap-2 text-right justify-end">
+                    <span className="bg-indigo-50 text-indigo-800 text-[10px] px-2 py-0.5 rounded-sm font-bold uppercase">
+                      {SUBJECTS[activeTestCard.subjectId].name}
+                    </span>
+                    <span className={`text-[10px] px-2 py-0.5 rounded-sm font-bold uppercase ${
+                      activeTestCard.type === "noun" ? "bg-amber-100 text-amber-800" : "bg-purple-100 text-purple-800"
+                    }`}>
+                      {activeTestCard.type === "noun" ? "名词解释 📚" : "挖空填空 🕳️"}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Question stage */}
+                <div className="py-6 space-y-4 text-center">
+                  {activeTestCard.type === "noun" ? (
+                    <div>
+                      <span className="text-xs text-gray-400 block mb-2 font-medium">请自我对照回忆，并口头核验以下医学名词的含义：</span>
+                      <h3 className="text-xl sm:text-2xl font-extrabold text-slate-900 tracking-tight">
+                        {activeTestCard.title}
+                      </h3>
+                    </div>
+                  ) : (
+                    <div>
+                      <span className="text-xs text-gray-400 block mb-2 font-medium">请阅读，并尝试回忆空缺的考点内容：</span>
+                      <p className="text-sm sm:text-base text-gray-800 leading-relaxed font-semibold bg-gray-50/50 p-4 rounded-xl border border-gray-100">
+                        {activeTestCard.title}
+                      </p>
+                    </div>
+                  )}
+
+                  {activeTestCard.hint && (
+                    <div className="inline-flex items-center gap-1 text-[10px] bg-rose-50 border border-rose-100 text-rose-700 px-3 py-1 rounded-full text-left">
+                      <Lightbulb className="w-3.5 h-3.5 text-rose-500 shrink-0" />
+                      <span>博傲讲义重点：{activeTestCard.hint}</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Cloze test in review */}
+                {activeTestCard.type === "cloze" && !isAnswerRevealed && (
+                  <div className="bg-slate-50 p-4 rounded-2xl border border-gray-100 space-y-3 text-left">
+                    <label className="block text-xs font-bold text-gray-500">✍️ 请拼写进行温故对照：</label>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={clozeUserAnswer}
+                        onChange={(e) => setClozeUserAnswer(e.target.value)}
+                        placeholder="打字输入您的印象词汇..."
+                        className="flex-1 px-4 py-2.5 bg-white border border-gray-300 rounded-xl text-xs sm:text-sm focus:outline-hidden focus:border-indigo-500"
+                      />
+                      <button
+                        onClick={checkClozeAnswer}
+                        className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold shadow-xs transition shrink-0 cursor-pointer"
+                      >
+                        核对答案
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Answer reveal container */}
+                <div className="border-t border-gray-100 pt-6">
+                  {isAnswerRevealed ? (
+                    <div className="bg-indigo-50 bg-opacity-70 p-5 rounded-2xl border border-indigo-100 space-y-4 text-left animate-in fade-in duration-300">
+                      {activeTestCard.type === "cloze" && isClozeCorrect !== null && (
+                        <div className="flex items-center gap-2 font-bold mb-1">
+                          {isClozeCorrect ? (
+                            <span className="text-emerald-700 text-xs flex items-center gap-1">
+                              <CheckCircle2 className="w-4 h-4 text-emerald-600 fill-emerald-100" />
+                              印象契合！记诵完全正确。
+                            </span>
+                          ) : (
+                            <span className="text-rose-750 text-rose-800 text-xs flex items-center gap-1">
+                              <XCircle className="w-4 h-4 text-rose-500 fill-rose-100" />
+                              有一些细节偏差，让我们来核验教科书级答案：
+                            </span>
+                          )}
+                        </div>
+                      )}
+
+                      <div>
+                        <span className="text-[10px] font-extrabold text-indigo-850 uppercase tracking-wider block mb-1">
+                          博傲大纲标准解剖：
+                        </span>
+                        <p className="text-slate-900 font-mono text-sm leading-relaxed whitespace-pre-line">
+                          {activeTestCard.answer}
+                        </p>
+                      </div>
+
+                      <div className="pt-2 text-[10px] text-gray-400 italic">
+                        核对完毕了吗？请点击下方反馈，完成艾宾浩斯阶梯提升或重温巩固：
+                      </div>
+                    </div>
+                  ) : (
+                    activeTestCard.type === "noun" && (
+                      <button
+                        onClick={() => setIsAnswerRevealed(true)}
+                        className="w-full py-4 bg-indigo-950 hover:bg-indigo-900 transition text-white rounded-2xl text-xs md:text-sm font-semibold flex items-center justify-center gap-1.5 shadow-xs cursor-pointer"
+                      >
+                        <Eye className="w-4 h-4 text-indigo-400" />
+                        <span>🧐 细想几秒并口述，点击比对教科书标准定义</span>
                       </button>
                     )
                   )}
                 </div>
 
                 {/* Flip helpers and next */}
-                <div className="flex items-center justify-between pt-4 border-t border-gray-100" id="test-actions-foot">
-                  <div className="flex gap-2" id="test-feedback-buttons">
+                <div className="flex items-center justify-between pt-4 border-t border-gray-100">
+                  <div className="flex gap-2">
                     {isAnswerRevealed && (
                       <>
                         <button
                           onClick={() => { updateEbbinghaus(activeTestCard.id, true); handleNextTest(); }}
-                          className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 transition shadow-xs"
-                          id="btn-self-rate-yes"
+                          className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 transition cursor-pointer"
                         >
                           <Check className="w-3.5 h-3.5" />
-                          <span>记住了 (晋级)</span>
+                          <span>顺利记起 (晋级下一个阶段)</span>
                         </button>
                         <button
                           onClick={() => { updateEbbinghaus(activeTestCard.id, false); handleNextTest(); }}
-                          className="px-3.5 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-semibold rounded-xl flex items-center gap-1.5 transition border border-rose-100"
-                          id="btn-self-rate-no"
+                          className="px-4 py-2.5 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-semibold rounded-xl flex items-center gap-1.5 transition border border-rose-100 cursor-pointer"
                         >
-                          <span>残缺/忘了 (重温)</span>
+                          <span>残缺/忘了 (重温巩固)</span>
                         </button>
                       </>
                     )}
@@ -984,8 +1372,7 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
 
                   <button
                     onClick={handleNextTest}
-                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg flex items-center gap-1 transition"
-                    id="btn-skip-test"
+                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg flex items-center gap-1 transition cursor-pointer"
                   >
                     <span>换下一张</span>
                     <ArrowRight className="w-3.5 h-3.5" />
@@ -1005,14 +1392,9 @@ export default function ReviewDeckView({ currentUser = null }: ReviewDeckProps) 
           <span className="font-bold">博傲随学心得：</span>
           护理学硕士考试对于医学专业词汇要求极高，尤其是各种并发症和诊断数值。对于像
           <strong>「高钾低钾心电图」</strong>、<strong>「门静脉高压侧支循环」</strong>、<strong>「隔离预防色标」</strong>建议多多录入此卡盒，
-          反复调取「自测轮转模式」，在考场抢分绝对得心应手！
+          反复调取「新词待学过关」与「艾氏复习窗口」进行循环磨砺，在考场抢分绝对得心应手！
         </div>
       </div>
     </div>
   );
-
-  // Quick state toggling wrapper to prevent strict compilation flags on unused state indicators
-  function setIsRevealedAnswers(id: string) {
-    setIsAnswerRevealed(true);
-  }
 }
